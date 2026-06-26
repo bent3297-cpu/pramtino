@@ -1,4 +1,4 @@
-name: Build Promptino Myket Release APK
+name: Build Promptino Bazaar Release APK
 
 on:
   workflow_dispatch:
@@ -337,5 +337,6 @@ jobs:
       - name: Upload signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: promptino-myket-release-apk-v${{ env.APP_VERSION }}
+          name: promptino-bazaar-release-apk-v${{ env.APP_VERSION }}
           path: app/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 1
