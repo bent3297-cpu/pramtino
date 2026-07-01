@@ -1,9 +1,12 @@
-name: Build Promptino Bazaar Release APK
+name: Build Promptino Bazaar and Myket APKs
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -13,330 +16,148 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select and extract latest Flutter ZIP
+      - name: Read shared market version
+        id: version
+        shell: bash
         run: |
-          set -e
-          rm -rf extracted app selected_zip.txt
-          mkdir -p extracted app
+          set -euo pipefail
+          version_line="$(grep -E '^version:' pubspec.yaml | head -n 1 | sed -E 's/^version:[[:space:]]*//')"
+          test -n "$version_line"
+          [[ "$version_line" == *"+"* ]] || { echo "pubspec version must include a numeric build code, e.g. 2.4.15+50" >&2; exit 1; }
+          build_name="${version_line%%+*}"
+          build_number="${version_line##*+}"
+          [[ "$build_number" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid build number: $build_number" >&2; exit 1; }
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          import zipfile
-          import sys
-          import shutil
+          echo "build_name=$build_name" >> "$GITHUB_OUTPUT"
+          echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
+          echo "app_version=$version_line" >> "$GITHUB_OUTPUT"
 
-          def version_tuple(name: str):
-              match = re.search(r'[vV](\d+(?:[._-]\d+)*)', name)
-              if not match:
-                  return (0,)
-              return tuple(int(part) if part.isdigit() else 0 for part in re.split(r'[._-]+', match.group(1)))
-
-          def has_flutter_project(zip_path: Path):
-              try:
-                  with zipfile.ZipFile(zip_path, "r") as archive:
-                      return any(item.endswith("pubspec.yaml") for item in archive.namelist())
-              except Exception:
-                  return False
-
-          candidates = []
-          for zip_path in Path(".").rglob("*.zip"):
-              lower_name = zip_path.name.lower()
-              blocked_words = ["backend", "workflow", "fixed_workflow", "only", "keystore_package"]
-              if any(word in lower_name for word in blocked_words):
-                  continue
-              if not has_flutter_project(zip_path):
-                  continue
-              candidates.append((version_tuple(zip_path.name), zip_path.stat().st_mtime, zip_path))
-
-          if not candidates:
-              print("No valid Flutter ZIP found.")
-              sys.exit(1)
-
-          candidates.sort(reverse=True)
-          selected_zip = candidates[0][2]
-          print(f"Selected ZIP: {selected_zip}")
-          Path("selected_zip.txt").write_text(str(selected_zip), encoding="utf-8")
-
-          with zipfile.ZipFile(selected_zip, "r") as archive:
-              archive.extractall("extracted")
-
-          pubspec_files = list(Path("extracted").rglob("pubspec.yaml"))
-          if not pubspec_files:
-              print("No pubspec.yaml found after extraction.")
-              sys.exit(1)
-
-          project_dir = pubspec_files[0].parent
-          print(f"PROJECT_DIR: {project_dir}")
-
-          app_dir = Path("app")
-          if app_dir.exists():
-              shutil.rmtree(app_dir)
-          shutil.copytree(project_dir, app_dir)
-          PY
-
-      - name: Read app version from pubspec
-        working-directory: app
-        run: |
-          set -e
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          import os
-          import sys
-
-          pubspec = Path("pubspec.yaml").read_text(encoding="utf-8")
-          match = re.search(r"^version:\s*(\S+)", pubspec, re.MULTILINE)
-          if not match:
-              print("No version found in pubspec.yaml")
-              sys.exit(1)
-
-          version_line = match.group(1).strip()
-          if "+" in version_line:
-              build_name, build_number = version_line.split("+", 1)
-          else:
-              build_name, build_number = version_line, "1"
-
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
-              env.write(f"BUILD_NAME={build_name}\n")
-              env.write(f"BUILD_NUMBER={build_number}\n")
-              env.write(f"APP_VERSION={version_line}\n")
-
-          print(f"App version: {version_line}")
-          PY
-
-      - name: Setup Java 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK 36
+        shell: bash
         run: |
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
-      - name: Setup Flutter stable
+      - name: Set up Flutter stable
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Show versions
+      - name: Restore Android signing files
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_PROPERTIES_BASE64: ${{ secrets.ANDROID_KEY_PROPERTIES_BASE64 }}
         run: |
-          flutter --version
-          java -version
+          set -euo pipefail
 
-      - name: Preserve keystore, icons, splash and create Android scaffold safely
-        working-directory: app
-        run: |
-          set -e
+          mkdir -p android
 
-          cp -f pubspec.yaml /tmp/pubspec.yaml
-          cp -f lib/main.dart /tmp/main.dart
-
-          if [ -d assets ]; then
-            rm -rf /tmp/promptino_assets
-            cp -R assets /tmp/promptino_assets
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && -n "${ANDROID_KEY_PROPERTIES_BASE64:-}" ]]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/bazikhone_release_key.jks
+            printf '%s' "$ANDROID_KEY_PROPERTIES_BASE64" | base64 --decode > android/key.properties
           fi
 
-          if [ -d generated_android_icons ]; then
-            rm -rf /tmp/promptino_generated_android_icons
-            cp -R generated_android_icons /tmp/promptino_generated_android_icons
-          fi
+          test -s android/bazikhone_release_key.jks || {
+            echo "Missing Android keystore. Add ANDROID_KEYSTORE_BASE64 to GitHub Secrets." >&2
+            exit 1
+          }
 
-          if [ -d android/app/src/main/res ]; then
-            rm -rf /tmp/promptino_android_res
-            mkdir -p /tmp/promptino_android_res
-            cp -R android/app/src/main/res/. /tmp/promptino_android_res/
-          fi
+          test -s android/key.properties || {
+            echo "Missing key.properties. Add ANDROID_KEY_PROPERTIES_BASE64 to GitHub Secrets." >&2
+            exit 1
+          }
 
-          if [ -f android/key.properties ]; then
-            cp -f android/key.properties /tmp/key.properties
-          fi
+      - name: Generate and patch Android project
+        shell: bash
+        run: bash tools/prepare_android.sh
 
-          if [ -f android/bazikhone_release_key.jks ]; then
-            cp -f android/bazikhone_release_key.jks /tmp/bazikhone_release_key.jks
-          fi
-
-          flutter create --platforms=android --overwrite .
-
-          cp -f /tmp/pubspec.yaml pubspec.yaml
-          cp -f /tmp/main.dart lib/main.dart
-
-          if [ -d /tmp/promptino_assets ]; then
-            rm -rf assets
-            cp -R /tmp/promptino_assets assets
-          fi
-
-          if [ -d /tmp/promptino_generated_android_icons ]; then
-            rm -rf generated_android_icons
-            cp -R /tmp/promptino_generated_android_icons generated_android_icons
-          fi
-
-          if [ -d /tmp/promptino_android_res ]; then
-            mkdir -p android/app/src/main/res
-            cp -R /tmp/promptino_android_res/. android/app/src/main/res/
-          fi
-
-          if [ -f /tmp/key.properties ]; then
-            cp -f /tmp/key.properties android/key.properties
-          fi
-
-          if [ -f /tmp/bazikhone_release_key.jks ]; then
-            cp -f /tmp/bazikhone_release_key.jks android/bazikhone_release_key.jks
-          fi
-
-      - name: Patch package name, signing, Android config, Groovy Gradle, JVM target and R8
-        working-directory: app
-        run: |
-          set -e
-
-          cat > android/app/proguard-rules.pro <<'EOF'
-          -dontwarn com.mbridge.**
-          -dontwarn com.mbridge.msdk.**
-          -dontwarn com.mbridge.msdk.nativex.view.**
-          -dontwarn com.mbridge.msdk.video.bt.module.orglistener.**
-          -keep class com.adivery.** { *; }
-          -keep class com.mbridge.** { *; }
-          EOF
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          package_name = "mk.kadkhodai.promt"
-
-          for old_file in list(Path("android/app/src/main/kotlin").rglob("MainActivity.kt")) + list(Path("android/app/src/main/java").rglob("MainActivity.java")):
-              old_file.unlink(missing_ok=True)
-
-          main_activity_dir = Path("android/app/src/main/kotlin/mk/kadkhodai/promt")
-          main_activity_dir.mkdir(parents=True, exist_ok=True)
-          (main_activity_dir / "MainActivity.kt").write_text(
-              "package mk.kadkhodai.promt\n\n"
-              "import io.flutter.embedding.android.FlutterActivity\n\n"
-              "class MainActivity: FlutterActivity()\n",
-              encoding="utf-8"
-          )
-
-          manifest = Path("android/app/src/main/AndroidManifest.xml")
-          if manifest.exists():
-              content = manifest.read_text(encoding="utf-8")
-              if "android.permission.INTERNET" not in content:
-                  index = content.find(">")
-                  content = content[:index + 1] + '\n    <uses-permission android:name="android.permission.INTERNET"/>' + content[index + 1:]
-              content = re.sub(r'android:name="\.MainActivity"', f'android:name="{package_name}.MainActivity"', content)
-              manifest.write_text(content, encoding="utf-8")
-
-          kts = Path("android/app/build.gradle.kts")
-          if kts.exists():
-              kts.unlink()
-
-          lines = [
-              "plugins {",
-              "    id 'com.android.application'",
-              "    id 'kotlin-android'",
-              "    id 'dev.flutter.flutter-gradle-plugin'",
-              "}",
-              "",
-              "def keystoreProperties = new Properties()",
-              "def keystorePropertiesFile = rootProject.file('key.properties')",
-              "if (keystorePropertiesFile.exists()) {",
-              "    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))",
-              "}",
-              "",
-              "android {",
-              f"    namespace '{package_name}'",
-              "    compileSdk 36",
-              "    ndkVersion flutter.ndkVersion",
-              "",
-              "    defaultConfig {",
-              f"        applicationId '{package_name}'",
-              "        minSdk 23",
-              "        targetSdk 36",
-              "        versionCode flutter.versionCode",
-              "        versionName flutter.versionName",
-              "    }",
-              "",
-              "    compileOptions {",
-              "        sourceCompatibility JavaVersion.VERSION_17",
-              "        targetCompatibility JavaVersion.VERSION_17",
-              "    }",
-              "",
-              "    kotlinOptions {",
-              "        jvmTarget = '17'",
-              "    }",
-              "",
-              "    signingConfigs {",
-              "        release {",
-              "            keyAlias keystoreProperties['keyAlias']",
-              "            keyPassword keystoreProperties['keyPassword']",
-              "            storeFile file(keystoreProperties['storeFile'])",
-              "            storePassword keystoreProperties['storePassword']",
-              "        }",
-              "    }",
-              "",
-              "    buildTypes {",
-              "        release {",
-              "            signingConfig signingConfigs.release",
-              "            minifyEnabled false",
-              "            shrinkResources false",
-              "            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'",
-              "        }",
-              "    }",
-              "}",
-              "",
-              "flutter {",
-              "    source '../..'",
-              "}",
-              ""
-          ]
-
-          Path("android/app/build.gradle").write_text("\n".join(lines), encoding="utf-8")
-          print("Package/signing/Groovy Gradle/JVM patch done:", package_name)
-          PY
-
-      - name: Verify keystore, package, JVM target, icons and splash exist
-        working-directory: app
-        run: |
-          set -e
-          test -f android/key.properties
-          test -f android/bazikhone_release_key.jks
-          test -f android/app/build.gradle
-          test ! -f android/app/build.gradle.kts
-          test -f android/app/src/main/res/mipmap-mdpi/ic_launcher.png
-          test -f android/app/src/main/res/mipmap-hdpi/ic_launcher.png
-          test -f android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
-          test -f android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-          test -f android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-          test -f android/app/src/main/res/drawable-nodpi/splash_screen.png
-          test -f android/app/src/main/res/drawable/launch_background.xml
-          echo "Keystore, icon, splash and Groovy Gradle files exist."
-          grep -q "mk.kadkhodai.promt" android/app/build.gradle
-          grep -q "jvmTarget = '17'" android/app/build.gradle
-
-      - name: Get dependencies
-        working-directory: app
+      - name: Get Flutter dependencies
         run: flutter pub get
 
-      - name: Verify app is not Flutter demo
-        working-directory: app
+      - name: Verify source
+        shell: bash
         run: |
-          if grep -q "Flutter Demo Home Page" lib/main.dart; then
-            echo "Default Flutter demo detected. Stop."
+          set -euo pipefail
+          ! grep -q "Flutter Demo Home Page" lib/main.dart
+          grep -q "mk.kadkhodai.promt" android/app/build.gradle
+          test -f android/app/src/main/res/drawable-nodpi/splash_screen.png
+
+      - name: Build shared signed APK
+        run: >-
+          flutter build apk --release --no-shrink
+          --build-name=${{ steps.version.outputs.build_name }}
+          --build-number=${{ steps.version.outputs.build_number }}
+
+      - name: Verify version and create Bazaar and Myket outputs
+        shell: bash
+        env:
+          BUILD_NAME: ${{ steps.version.outputs.build_name }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+
+          apk="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$apk"
+
+          aapt_bin="${ANDROID_HOME}/build-tools/36.0.0/aapt"
+          test -x "$aapt_bin"
+
+          badging="$($aapt_bin dump badging "$apk")"
+          echo "$badging"
+
+          grep -q "package: name='mk.kadkhodai.promt'" <<< "$badging"
+          grep -q "versionCode='${BUILD_NUMBER}'" <<< "$badging"
+          grep -q "versionName='${BUILD_NAME}'" <<< "$badging"
+
+          mkdir -p dist/bazaar dist/myket
+
+          bazaar_apk="dist/bazaar/promptino-bazaar-v${APP_VERSION}.apk"
+          myket_apk="dist/myket/promptino-myket-v${APP_VERSION}.apk"
+
+          cp "$apk" "$bazaar_apk"
+          cp "$apk" "$myket_apk"
+
+          bazaar_sha="$(sha256sum "$bazaar_apk" | awk '{print $1}')"
+          myket_sha="$(sha256sum "$myket_apk" | awk '{print $1}')"
+
+          [[ "$bazaar_sha" == "$myket_sha" ]] || {
+            echo "Market APK hashes differ; stopping." >&2
             exit 1
-          fi
+          }
 
-      - name: Build signed APK without shrink
-        working-directory: app
-        run: flutter build apk --release --no-shrink --build-name=${{ env.BUILD_NAME }} --build-number=${{ env.BUILD_NUMBER }}
+          for store in bazaar myket; do
+            cat > "dist/${store}/MARKET_VERSION.txt" <<EOF
+          Store: ${store}
+          Package: mk.kadkhodai.promt
+          versionName: ${BUILD_NAME}
+          versionCode: ${BUILD_NUMBER}
+          SHA256: ${bazaar_sha}
+          This APK is binary-identical to the other market output; only the file name differs.
+          EOF
+          done
 
-      - name: Upload signed APK
+      - name: Upload Bazaar APK
         uses: actions/upload-artifact@v4
         with:
-          name: promptino-bazaar-release-apk-v${{ env.APP_VERSION }}
-          path: app/build/app/outputs/flutter-apk/app-release.apk
-          retention-days: 1
+          name: promptino-bazaar-v${{ steps.version.outputs.app_version }}
+          path: dist/bazaar/
+          retention-days: 7
+
+      - name: Upload Myket APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: promptino-myket-v${{ steps.version.outputs.app_version }}
+          path: dist/myket/
+          retention-days: 7
