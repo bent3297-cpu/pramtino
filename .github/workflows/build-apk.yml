@@ -18,51 +18,111 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find Flutter project and read shared market version
-        id: project
+      - name: Find and extract Flutter ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          mapfile -t pubspec_files < <(
-            find . \
-              -type f \
-              -name "pubspec.yaml" \
-              -not -path "./.git/*" \
-              -not -path "*/.dart_tool/*" \
-              -not -path "*/build/*" \
-              | sed 's#^\./##'
-          )
+          rm -rf extracted_flutter app
+          mkdir -p extracted_flutter
 
-          if [ "${#pubspec_files[@]}" -eq 0 ]; then
-            echo "Flutter project not found: no pubspec.yaml exists in this repository."
-            echo "Upload the CONTENTS of the Flutter ZIP into GitHub, not an empty ZIP or backend-only files."
-            exit 1
-          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+          import re
+          import shutil
+          import sys
 
-          if [ "${#pubspec_files[@]}" -gt 1 ]; then
-            echo "More than one pubspec.yaml was found:"
-            printf '%s\n' "${pubspec_files[@]}"
-            echo "Keep only one Flutter project in this repository."
-            exit 1
-          fi
+          def version_tuple(name: str):
+              match = re.search(r'v?(\d+(?:[._-]\d+)+)', name.lower())
+              if not match:
+                  return (0,)
+              return tuple(
+                  int(item) if item.isdigit() else 0
+                  for item in re.split(r'[._-]+', match.group(1))
+              )
 
-          PUBSPEC_PATH="${pubspec_files[0]}"
-          APP_DIR="$(dirname "$PUBSPEC_PATH")"
+          def is_flutter_zip(zip_path: Path):
+              try:
+                  with zipfile.ZipFile(zip_path, "r") as archive:
+                      names = archive.namelist()
+                      return any(name.endswith("pubspec.yaml") for name in names) and \
+                             any(name.endswith("lib/main.dart") for name in names)
+              except zipfile.BadZipFile:
+                  return False
 
-          echo "Detected Flutter project directory: $APP_DIR"
-          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
-          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          candidates = []
 
-          version_line="$(grep -E '^version:' "$PUBSPEC_PATH" | head -n 1 | sed -E 's/^version:[[:space:]]*//')"
+          for zip_path in Path(".").rglob("*.zip"):
+              if ".git" in zip_path.parts:
+                  continue
 
-          if [ -z "$version_line" ]; then
-            echo "No version was found in pubspec.yaml."
-            exit 1
-          fi
+              if is_flutter_zip(zip_path):
+                  candidates.append(
+                      (
+                          version_tuple(zip_path.name),
+                          zip_path.stat().st_mtime,
+                          zip_path
+                      )
+                  )
+
+          if not candidates:
+              print("No Flutter ZIP found.")
+              print("Upload promptino_flutter_*.zip to the repository root.")
+              sys.exit(1)
+
+          candidates.sort(reverse=True)
+
+          selected_zip = candidates[0][2]
+
+          print(f"Selected Flutter ZIP: {selected_zip}")
+
+          with zipfile.ZipFile(selected_zip, "r") as archive:
+              archive.extractall("extracted_flutter")
+
+          pubspecs = list(Path("extracted_flutter").rglob("pubspec.yaml"))
+
+          valid_projects = []
+
+          for pubspec in pubspecs:
+              project_dir = pubspec.parent
+              if (project_dir / "lib" / "main.dart").is_file():
+                  valid_projects.append(project_dir)
+
+          if len(valid_projects) == 0:
+              print("Flutter project was not found after extracting ZIP.")
+              sys.exit(1)
+
+          if len(valid_projects) > 1:
+              print("More than one Flutter project was found:")
+              for project in valid_projects:
+                  print(project)
+              sys.exit(1)
+
+          project_dir = valid_projects[0]
+
+          print(f"Flutter project directory: {project_dir}")
+
+          shutil.copytree(project_dir, "app")
+
+          print("Flutter project copied to app/")
+          PY
+
+          test -f app/pubspec.yaml
+          test -f app/lib/main.dart
+
+      - name: Read shared Bazaar and Myket version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version_line="$(grep -E '^version:' app/pubspec.yaml | head -n 1 | sed -E 's/^version:[[:space:]]*//')"
+
+          test -n "$version_line"
 
           if [[ "$version_line" != *"+"* ]]; then
-            echo "Version must include build number. Example: 2.4.15+50"
+            echo "Version must have build number. Example: 2.4.15+50"
             exit 1
           fi
 
@@ -78,8 +138,8 @@ jobs:
           echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
           echo "app_version=$version_line" >> "$GITHUB_OUTPUT"
 
-          echo "Detected versionName: $build_name"
-          echo "Detected versionCode: $build_number"
+          echo "versionName: $build_name"
+          echo "versionCode: $build_number"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -94,7 +154,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           yes | sdkmanager --licenses >/dev/null || true
+
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-36" \
@@ -106,13 +168,11 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Show environment versions
+      - name: Show versions
         shell: bash
         run: |
           flutter --version
           java -version
-          echo "Flutter project directory: $APP_DIR"
-          ls -la "$APP_DIR"
 
       - name: Restore Android signing files
         shell: bash
@@ -122,27 +182,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p "$APP_DIR/android"
+          mkdir -p app/android
 
           if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
             printf '%s' "$ANDROID_KEYSTORE_BASE64" \
               | base64 --decode \
-              > "$APP_DIR/android/bazikhone_release_key.jks"
+              > app/android/bazikhone_release_key.jks
           fi
 
           if [[ -n "${ANDROID_KEY_PROPERTIES_BASE64:-}" ]]; then
             printf '%s' "$ANDROID_KEY_PROPERTIES_BASE64" \
               | base64 --decode \
-              > "$APP_DIR/android/key.properties"
+              > app/android/key.properties
           fi
 
-          test -s "$APP_DIR/android/bazikhone_release_key.jks" || {
-            echo "Keystore not found. Add ANDROID_KEYSTORE_BASE64 in GitHub Secrets."
+          test -s app/android/bazikhone_release_key.jks || {
+            echo "Missing ANDROID_KEYSTORE_BASE64 secret."
             exit 1
           }
 
-          test -s "$APP_DIR/android/key.properties" || {
-            echo "key.properties not found. Add ANDROID_KEY_PROPERTIES_BASE64 in GitHub Secrets."
+          test -s app/android/key.properties || {
+            echo "Missing ANDROID_KEY_PROPERTIES_BASE64 secret."
             exit 1
           }
 
@@ -151,69 +211,56 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -f "$APP_DIR/tools/prepare_android.sh" || {
-            echo "tools/prepare_android.sh was not found in Flutter project."
+          test -f app/tools/prepare_android.sh || {
+            echo "tools/prepare_android.sh was not found."
             exit 1
           }
 
-          chmod +x "$APP_DIR/tools/prepare_android.sh"
+          chmod +x app/tools/prepare_android.sh
 
-          (
-            cd "$APP_DIR"
-            bash tools/prepare_android.sh
-          )
+          cd app
+          bash tools/prepare_android.sh
 
       - name: Get Flutter dependencies
+        working-directory: app
+        run: flutter pub get
+
+      - name: Verify app files
         shell: bash
         run: |
           set -euo pipefail
 
-          (
-            cd "$APP_DIR"
-            flutter pub get
-          )
+          test -f app/lib/main.dart
+          test -f app/pubspec.yaml
+          test -f app/android/app/build.gradle
+          test -f app/android/app/src/main/res/drawable-nodpi/splash_screen.png
 
-      - name: Verify Flutter source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -f "$APP_DIR/lib/main.dart"
-          test -f "$APP_DIR/pubspec.yaml"
-          test -f "$APP_DIR/android/app/build.gradle"
-          test -f "$APP_DIR/android/app/src/main/res/drawable-nodpi/splash_screen.png"
-
-          if grep -q "Flutter Demo Home Page" "$APP_DIR/lib/main.dart"; then
+          if grep -q "Flutter Demo Home Page" app/lib/main.dart; then
             echo "Default Flutter demo source detected."
             exit 1
           fi
 
-          grep -q "mk.kadkhodai.promt" "$APP_DIR/android/app/build.gradle"
+          grep -q "mk.kadkhodai.promt" app/android/app/build.gradle
 
       - name: Build shared signed APK
-        shell: bash
+        working-directory: app
         run: |
-          set -euo pipefail
-
-          (
-            cd "$APP_DIR"
-            flutter build apk \
-              --release \
-              --no-shrink \
-              --build-name="${{ steps.project.outputs.build_name }}" \
-              --build-number="${{ steps.project.outputs.build_number }}"
-          )
+          flutter build apk \
+            --release \
+            --no-shrink \
+            --build-name="${{ steps.version.outputs.build_name }}" \
+            --build-number="${{ steps.version.outputs.build_number }}"
 
       - name: Create Bazaar and Myket APK outputs
         shell: bash
         env:
-          BUILD_NAME: ${{ steps.project.outputs.build_name }}
-          BUILD_NUMBER: ${{ steps.project.outputs.build_number }}
-          APP_VERSION: ${{ steps.project.outputs.app_version }}
+          BUILD_NAME: ${{ steps.version.outputs.build_name }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
         run: |
           set -euo pipefail
 
-          apk="$APP_DIR/build/app/outputs/flutter-apk/app-release.apk"
+          apk="app/build/app/outputs/flutter-apk/app-release.apk"
 
           test -s "$apk" || {
             echo "APK was not created."
@@ -223,7 +270,7 @@ jobs:
           aapt_bin="${ANDROID_HOME}/build-tools/36.0.0/aapt"
 
           test -x "$aapt_bin" || {
-            echo "aapt tool was not found."
+            echo "aapt was not found."
             exit 1
           }
 
@@ -236,6 +283,7 @@ jobs:
           grep -q "versionName='${BUILD_NAME}'" <<< "$badging"
 
           rm -rf dist
+
           mkdir -p dist/bazaar
           mkdir -p dist/myket
 
@@ -249,11 +297,11 @@ jobs:
           myket_sha="$(sha256sum "$myket_apk" | awk '{print $1}')"
 
           if [[ "$bazaar_sha" != "$myket_sha" ]]; then
-            echo "Bazaar and Myket APK hashes are different."
+            echo "Bazaar and Myket APK files are not identical."
             exit 1
           fi
 
-          cat > "dist/bazaar/MARKET_VERSION.txt" <<EOF
+          cat > dist/bazaar/MARKET_VERSION.txt <<EOF
           Store: Cafe Bazaar
           Package: mk.kadkhodai.promt
           versionName: ${BUILD_NAME}
@@ -261,7 +309,7 @@ jobs:
           SHA256: ${bazaar_sha}
           EOF
 
-          cat > "dist/myket/MARKET_VERSION.txt" <<EOF
+          cat > dist/myket/MARKET_VERSION.txt <<EOF
           Store: Myket
           Package: mk.kadkhodai.promt
           versionName: ${BUILD_NAME}
@@ -272,13 +320,13 @@ jobs:
       - name: Upload Bazaar APK
         uses: actions/upload-artifact@v4
         with:
-          name: promptino-bazaar-v${{ steps.project.outputs.app_version }}
+          name: promptino-bazaar-v${{ steps.version.outputs.app_version }}
           path: dist/bazaar/
           retention-days: 7
 
       - name: Upload Myket APK
         uses: actions/upload-artifact@v4
         with:
-          name: promptino-myket-v${{ steps.project.outputs.app_version }}
+          name: promptino-myket-v${{ steps.version.outputs.app_version }}
           path: dist/myket/
           retention-days: 7
