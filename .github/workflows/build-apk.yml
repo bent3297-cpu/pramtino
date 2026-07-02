@@ -23,56 +23,56 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf extracted_flutter app
+          rm -rf extracted_flutter app dist
           mkdir -p extracted_flutter
 
           python3 - <<'PY'
           from pathlib import Path
-          import zipfile
           import re
           import shutil
           import sys
+          import zipfile
 
           def version_tuple(name: str):
-              match = re.search(r'v?(\d+(?:[._-]\d+)+)', name.lower())
+              match = re.search(r"[vV]?(\d+(?:[._-]\d+)+)", name)
               if not match:
                   return (0,)
               return tuple(
-                  int(item) if item.isdigit() else 0
-                  for item in re.split(r'[._-]+', match.group(1))
+                  int(part) if part.isdigit() else 0
+                  for part in re.split(r"[._-]+", match.group(1))
               )
 
-          def is_flutter_zip(zip_path: Path):
+          def is_flutter_project_zip(path: Path) -> bool:
               try:
-                  with zipfile.ZipFile(zip_path, "r") as archive:
+                  with zipfile.ZipFile(path, "r") as archive:
                       names = archive.namelist()
-                      return any(name.endswith("pubspec.yaml") for name in names) and \
-                             any(name.endswith("lib/main.dart") for name in names)
-              except zipfile.BadZipFile:
+                      return (
+                          any(name.endswith("pubspec.yaml") for name in names)
+                          and any(name.endswith("lib/main.dart") for name in names)
+                          and any(name.endswith("tools/prepare_android.sh") for name in names)
+                      )
+              except (zipfile.BadZipFile, OSError):
                   return False
 
           candidates = []
-
           for zip_path in Path(".").rglob("*.zip"):
               if ".git" in zip_path.parts:
                   continue
-
-              if is_flutter_zip(zip_path):
+              if is_flutter_project_zip(zip_path):
                   candidates.append(
                       (
                           version_tuple(zip_path.name),
                           zip_path.stat().st_mtime,
-                          zip_path
+                          zip_path,
                       )
                   )
 
           if not candidates:
-              print("No Flutter ZIP found.")
-              print("Upload promptino_flutter_*.zip to the repository root.")
+              print("No valid Flutter source ZIP was found.")
+              print("Upload promptino_flutter_*.zip to this repository, then run the workflow again.")
               sys.exit(1)
 
           candidates.sort(reverse=True)
-
           selected_zip = candidates[0][2]
 
           print(f"Selected Flutter ZIP: {selected_zip}")
@@ -80,36 +80,28 @@ jobs:
           with zipfile.ZipFile(selected_zip, "r") as archive:
               archive.extractall("extracted_flutter")
 
-          pubspecs = list(Path("extracted_flutter").rglob("pubspec.yaml"))
+          projects = []
+          for pubspec in Path("extracted_flutter").rglob("pubspec.yaml"):
+              root = pubspec.parent
+              if (
+                  (root / "lib" / "main.dart").is_file()
+                  and (root / "tools" / "prepare_android.sh").is_file()
+              ):
+                  projects.append(root)
 
-          valid_projects = []
-
-          for pubspec in pubspecs:
-              project_dir = pubspec.parent
-              if (project_dir / "lib" / "main.dart").is_file():
-                  valid_projects.append(project_dir)
-
-          if len(valid_projects) == 0:
-              print("Flutter project was not found after extracting ZIP.")
-              sys.exit(1)
-
-          if len(valid_projects) > 1:
-              print("More than one Flutter project was found:")
-              for project in valid_projects:
+          if len(projects) != 1:
+              print("Exactly one Flutter project must exist in the selected ZIP.")
+              for project in projects:
                   print(project)
               sys.exit(1)
 
-          project_dir = valid_projects[0]
-
-          print(f"Flutter project directory: {project_dir}")
-
-          shutil.copytree(project_dir, "app")
-
-          print("Flutter project copied to app/")
+          shutil.copytree(projects[0], "app")
+          print(f"Flutter project extracted to app/ from: {projects[0]}")
           PY
 
           test -f app/pubspec.yaml
           test -f app/lib/main.dart
+          test -f app/tools/prepare_android.sh
 
       - name: Read shared Bazaar and Myket version
         id: version
@@ -118,11 +110,10 @@ jobs:
           set -euo pipefail
 
           version_line="$(grep -E '^version:' app/pubspec.yaml | head -n 1 | sed -E 's/^version:[[:space:]]*//')"
-
           test -n "$version_line"
 
           if [[ "$version_line" != *"+"* ]]; then
-            echo "Version must have build number. Example: 2.4.15+50"
+            echo "Version must include a numeric build code, for example 2.4.17+52." >&2
             exit 1
           fi
 
@@ -130,7 +121,7 @@ jobs:
           build_number="${version_line##*+}"
 
           if ! [[ "$build_number" =~ ^[1-9][0-9]*$ ]]; then
-            echo "Invalid versionCode: $build_number"
+            echo "Invalid Android versionCode: $build_number" >&2
             exit 1
           fi
 
@@ -138,8 +129,8 @@ jobs:
           echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
           echo "app_version=$version_line" >> "$GITHUB_OUTPUT"
 
-          echo "versionName: $build_name"
-          echo "versionCode: $build_number"
+          echo "Shared versionName: $build_name"
+          echo "Shared versionCode: $build_number"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -154,9 +145,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           yes | sdkmanager --licenses >/dev/null || true
-
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-36" \
@@ -167,12 +156,6 @@ jobs:
         with:
           channel: stable
           cache: true
-
-      - name: Show versions
-        shell: bash
-        run: |
-          flutter --version
-          java -version
 
       - name: Restore Android signing files
         shell: bash
@@ -197,12 +180,12 @@ jobs:
           fi
 
           test -s app/android/bazikhone_release_key.jks || {
-            echo "Missing ANDROID_KEYSTORE_BASE64 secret."
+            echo "Android keystore is missing." >&2
             exit 1
           }
 
           test -s app/android/key.properties || {
-            echo "Missing ANDROID_KEY_PROPERTIES_BASE64 secret."
+            echo "android/key.properties is missing." >&2
             exit 1
           }
 
@@ -210,48 +193,43 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          test -f app/tools/prepare_android.sh || {
-            echo "tools/prepare_android.sh was not found."
-            exit 1
-          }
-
           chmod +x app/tools/prepare_android.sh
 
-          cd app
-          bash tools/prepare_android.sh
+          (
+            cd app
+            bash tools/prepare_android.sh
+          )
 
       - name: Get Flutter dependencies
         working-directory: app
         run: flutter pub get
 
-      - name: Verify app files
+      - name: Verify release source
         shell: bash
         run: |
           set -euo pipefail
 
           test -f app/lib/main.dart
-          test -f app/pubspec.yaml
           test -f app/android/app/build.gradle
           test -f app/android/app/src/main/res/drawable-nodpi/splash_screen.png
+          test ! -f app/android/app/build.gradle.kts
 
           if grep -q "Flutter Demo Home Page" app/lib/main.dart; then
-            echo "Default Flutter demo source detected."
+            echo "Default Flutter demo source was detected." >&2
             exit 1
           fi
 
           grep -q "mk.kadkhodai.promt" app/android/app/build.gradle
+          grep -q "jvmTarget = '17'" app/android/app/build.gradle
 
-      - name: Build shared signed APK
+      - name: Build signed shared APK
         working-directory: app
-        run: |
-          flutter build apk \
-            --release \
-            --no-shrink \
-            --build-name="${{ steps.version.outputs.build_name }}" \
-            --build-number="${{ steps.version.outputs.build_number }}"
+        run: >-
+          flutter build apk --release --no-shrink
+          --build-name=${{ steps.version.outputs.build_name }}
+          --build-number=${{ steps.version.outputs.build_number }}
 
-      - name: Create Bazaar and Myket APK outputs
+      - name: Create Bazaar and Myket deliverables
         shell: bash
         env:
           BUILD_NAME: ${{ steps.version.outputs.build_name }}
@@ -263,18 +241,18 @@ jobs:
           apk="app/build/app/outputs/flutter-apk/app-release.apk"
 
           test -s "$apk" || {
-            echo "APK was not created."
+            echo "Release APK was not created." >&2
             exit 1
           }
 
           aapt_bin="${ANDROID_HOME}/build-tools/36.0.0/aapt"
 
           test -x "$aapt_bin" || {
-            echo "aapt was not found."
+            echo "Android aapt was not found." >&2
             exit 1
           }
 
-          badging="$("$aapt_bin" dump badging "$apk")"
+          badging="$($aapt_bin dump badging "$apk")"
 
           echo "$badging"
 
@@ -282,10 +260,7 @@ jobs:
           grep -q "versionCode='${BUILD_NUMBER}'" <<< "$badging"
           grep -q "versionName='${BUILD_NAME}'" <<< "$badging"
 
-          rm -rf dist
-
-          mkdir -p dist/bazaar
-          mkdir -p dist/myket
+          mkdir -p dist/bazaar dist/myket
 
           bazaar_apk="dist/bazaar/promptino-bazaar-v${APP_VERSION}.apk"
           myket_apk="dist/myket/promptino-myket-v${APP_VERSION}.apk"
@@ -297,7 +272,7 @@ jobs:
           myket_sha="$(sha256sum "$myket_apk" | awk '{print $1}')"
 
           if [[ "$bazaar_sha" != "$myket_sha" ]]; then
-            echo "Bazaar and Myket APK files are not identical."
+            echo "Bazaar and Myket APK hashes are unexpectedly different." >&2
             exit 1
           fi
 
@@ -307,6 +282,7 @@ jobs:
           versionName: ${BUILD_NAME}
           versionCode: ${BUILD_NUMBER}
           SHA256: ${bazaar_sha}
+          This APK is binary-identical to the Myket output; only the file name differs.
           EOF
 
           cat > dist/myket/MARKET_VERSION.txt <<EOF
@@ -315,6 +291,7 @@ jobs:
           versionName: ${BUILD_NAME}
           versionCode: ${BUILD_NUMBER}
           SHA256: ${myket_sha}
+          This APK is binary-identical to the Bazaar output; only the file name differs.
           EOF
 
       - name: Upload Bazaar APK
